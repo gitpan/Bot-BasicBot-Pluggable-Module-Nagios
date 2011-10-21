@@ -3,7 +3,7 @@ package Bot::BasicBot::Pluggable::Module::Nagios;
 use warnings;
 use strict;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use base 'Bot::BasicBot::Pluggable::Module';
 
@@ -60,6 +60,9 @@ A module to report Nagios alerts to IRC channels.
    nagios add http://example.com/cgi-bin/status.cgi username password #chan
    nagios list
    nagios del 1
+   nagios set setting_name value
+
+Say "nagios set" with no setting name for a list of valid settings.
 
 Full help is available at http://p3rl.org/Bot::BasicBot::Pluggable::Module::Nagios
 USAGE
@@ -115,6 +118,89 @@ sub told {
         $self->set('instances', $instances);
         return "OK, deleted instance $num";
     }
+    if (lc $command eq 'set') {
+        my ($setting, $value) = split /\s+/, $params, 2;
+        $setting = lc $setting;
+        
+        # Validator for durations, which recognises e.g. 30m and turns into
+        # seconds
+        my $validate_duration = sub {
+            my $value = lc shift;
+            if (my($num,$unit) = $value =~ m{^
+                (\d+)
+                (
+                    s(?:ecs?)?
+                    |
+                    m(?:mins?)?
+                    |
+                    h(?:hours?)?
+                )?
+            $}x) {
+                my $multiplier = {
+                    s => 1,
+                    m => 60,
+                    h => 60 * 60,
+                }->{$unit} || 1;
+                return $num * $multiplier;
+            } else {
+                return;
+            }
+        };
+
+        # Declare the settings we accept, what they should look like, and their
+        # description
+        my $duration_help = " (in seconds, or with unit, e.g. 60, 3m, 5h)";
+        my %valid_settings = (
+            poll_interval => {
+                description => "Interval between polls to Nagios"
+                    . $duration_help,
+                validator   => $validate_duration,
+            },
+            repeat_delay => {
+                description => "Time between repeated notifications "
+                    . "of the same issue" . $duration_help,
+                validator   => $validate_duration,
+            },
+            report_statuses => {
+                description => "List of statuses we should notify for"
+                    . " (default: CRITICAL, OK)",
+                validator   => sub {
+                    my @statuses = split /[\s,]+/, uc shift;
+                    return unless @statuses;
+                    return if 
+                        grep { !/^(OK|WARNING|CRITICAL|UNKNOWN)$/ } @statuses;
+                    return \@statuses;
+                },
+            },
+        );
+
+        # If we were called without a setting name, reply with the settings
+        # which are valid:
+        if (!$setting) {
+            my $reply = "Valid settings are:\n";
+            for my $setting (keys %valid_settings) {
+                $reply .= sprintf "%s (%s)\n",
+                    $setting, $valid_settings{$setting}->{description};
+            }
+            return $reply;
+        }
+
+        my $validator = $valid_settings{$setting}->{validator};
+        if (!$validator) {
+            return sprintf "Unknown setting '%s' (known settings: %s)",
+                $setting,
+                keys %valid_settings;
+        }
+
+        # The validator will return the value (possibly canonicalised) if it was
+        # acceptable, or undef if not:
+        if (defined(my $valid_value = $validator->($value))) {
+            $self->set($setting, $valid_value);
+            return "OK, set $setting to '$valid_value'";
+        } else {
+            return "Value '$value' is not valid for setting $setting";
+        }
+    }
 }
 
 my $last_polled = 0;
@@ -123,9 +209,17 @@ my %last_status;
 sub tick {
     my ($self) = @_;
 
-    # TODO: allow time between checks to be configurable 
-    return if (time - $last_polled < 60 * 1);
+    my $repeat_delay = $self->get('repeat_delay') || 15 * 60;
+    my $poll_delay = $self->get('poll_interval') || 120;
+    return if (time - $last_polled < $poll_delay);
     $last_polled = time;
+
+    # Find out what statuses we should report; do this here, so it's ready for
+    # use in the loop later (we don't want to re-do it for every service :) )
+    my $report_statuses = $self->get('report_statuses')
+        || [ qw( CRITICAL WARNING OK ) ];
+    my %should_report = map { $_ => 1 } @$report_statuses;
+
 
     my $instances = $self->get('instances') || [];
     instance:
@@ -172,9 +266,8 @@ sub tick {
                     and $host->{status} eq 'UP';
 
                 # If we've reported it as down recently, don't do so again yet
-                # TODO: make delay configurable
                 if ($last_status->{status} eq $host->{status}
-                    && time - $last_status->{timestamp} < 60 * 15)
+                    && time - $last_status->{timestamp} < $repeat_delay)
                 {
                     next host;
                 }
@@ -219,6 +312,7 @@ sub tick {
         for my $service (@service_statuses) {
             next if $host_down{$service->{host}};
 
+
             # See how many check attempts have found the service in this status;
             # if it's not enough for Nagios to send alerts, don't alert on IRC.
             # Don't do this if the status is "OK", though, as "OK" services
@@ -232,10 +326,10 @@ sub tick {
                 next if $last_status->{status} eq 'OK'
                     and $service->{status} eq 'OK';
 
-                # TODO: make the delay between subsequent wibbles about the same
-                # problem configurable by the user
+                # If we've already seen it in this status, don't report it again
+                # until the $repeat_delay is up
                 if ($last_status->{status} eq $service->{status}
-                    && time - $last_status->{timestamp} < 60 * 15)
+                    && time - $last_status->{timestamp} < $repeat_delay)
                 {
                     next service;
                 }
@@ -250,6 +344,9 @@ sub tick {
                     next service;
                 }
             }
+
+            # See if it's a status we should report.  
+            next service if !$should_report{ $service->{status} };
 
             # Note that we're about to bitch about this one, and add it to
             # %service_by_host ready for reporting
@@ -278,16 +375,6 @@ sub tick {
 Plenty of improvements are planned, including:
 
 =over 4
-
-=item * Configurable check / reporting intervals
-
-It should be possible to configure the interval between polling the Nagios
-instances, and the time between repeated notifications of the same problem.
-
-=item * Filtering services
-
-It should be possible to provide a pattern to match services which should not be
-announced, to stop repeated announcements about problematic services
 
 =item * Acknowledging problems
 

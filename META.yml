@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Bot-BasicBot-Pluggable-Module-Nagios
-version:            0.03
+version:            0.04
 abstract:           report Nagios alerts to IRC
 author:
     - David Precious <davidp@preshweb.co.uk>
